@@ -1,0 +1,10 @@
+{
+  "name": "@fossteams/teams-api-js",
+  "module": "./index.js",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "test:coverage": "bun test --coverage"
+  }
+}

@@ -37,6 +37,12 @@ func TestTeamsClientMethods(t *testing.T) {
 			return response(http.StatusOK, loadFixture(t, "resources/chatsvcagg/messages/messages-1.json")), nil
 		case mt.MiddleTier + "emea/beta/users/user@example.com/?enableGuest=true&includeIBBarredUsers=true&isMailAddress=true&skypeTeamsInfo=true&throwIfNotFound=false":
 			return response(http.StatusOK, loadFixture(t, "resources/mt/user/user-1.json")), nil
+		case mt.MiddleTier + "emea/beta/users/fetchShortProfile?enableGuest=true&includeIBBarredUsers=false&isMailAddress=false&skypeTeamsInfo=true":
+			return response(http.StatusOK, `{"value":[{"displayName":"Denys Vitali","email":"teams-cli@outlook.com","givenName":"Denys","surname":"Vitali","isShortProfile":true,"jobTitle":"","objectId":"fa814989-41d0-4d4b-a365-e5f44e406847","tenantName":"FossTeams","type":"ADUser","userLocation":"Remote","userPrincipalName":"teams-cli@outlook.com"}],"type":"Users"}`), nil
+		case mt.MiddleTier + "emea/beta/users/user@example.com/profilepicture?displayname=aaa":
+			return response(http.StatusOK, "anBlZy1ieXRlcw=="), nil
+		case mt.MiddleTier + "emea/beta/teams/user@example.com/profilepicturev2":
+			return response(http.StatusOK, "jpeg-bytes"), nil
 		case mt.MiddleTier + "emea/beta/users/tenants":
 			return response(http.StatusOK, loadFixture(t, "resources/mt/tenants/tenants-1.json")), nil
 		default:
@@ -75,6 +81,18 @@ func TestTeamsClientMethods(t *testing.T) {
 	me, err := client.GetMe()
 	if err != nil || me.Email != "teams-cli@outlook.com" {
 		t.Fatalf("unexpected me result: %#v %v", me, err)
+	}
+	shortProfiles, err := client.FetchShortProfile([]string{"8:orgid:fa814989-41d0-4d4b-a365-e5f44e406847"})
+	if err != nil || len(shortProfiles) != 1 {
+		t.Fatalf("unexpected short profiles: %#v %v", shortProfiles, err)
+	}
+	profilePicture, err := client.GetProfilePicture("user@example.com")
+	if err != nil || string(profilePicture) != "jpeg-bytes" {
+		t.Fatalf("unexpected profile picture: %q %v", string(profilePicture), err)
+	}
+	teamsProfilePicture, err := client.GetTeamsProfilePicture("user@example.com")
+	if err != nil || string(teamsProfilePicture) != "jpeg-bytes" {
+		t.Fatalf("unexpected teams profile picture: %q %v", string(teamsProfilePicture), err)
 	}
 	tenants, err := client.GetTenants()
 	if err != nil || len(tenants) != 1 {
