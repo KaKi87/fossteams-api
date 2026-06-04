@@ -1,134 +1,176 @@
-package mt_test
+package mt
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/fossteams/teams-api/pkg"
-	"github.com/fossteams/teams-api/pkg/models"
-	"github.com/fossteams/teams-api/pkg/mt"
-	"github.com/stretchr/testify/assert"
-	"io/ioutil"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/dgrijalva/jwt-go"
+	api "github.com/fossteams/teams-api/pkg"
 )
 
-func initTest(t *testing.T) *mt.Service {
-	token, err := api.GetRootToken()
-	if err != nil {
-		t.Error(err)
-	}
+type roundTripFunc func(*http.Request) (*http.Response, error)
 
-	userSvc, err := mt.NewMiddleTierService(api.Emea, token)
-
-	if err != nil {
-		t.Error(err)
-		t.Fail()
-	}
-	return userSvc
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
-func TestGetUser(t *testing.T) {
-	userSvc := initTest(t)
-	userSvc.DebugDisallowUnknownFields(true)
-	userSvc.DebugSave(true)
-	email, err := getTokenEmail(t)
-	user, err := userSvc.GetUser(email)
-	assert.Nil(t, err)
-	assert.NotNil(t, user)
-	fmt.Printf("user=%#v", user)
-	assert.Equal(t, email, user.Email)
-}
+func TestGetUserAndGetMe(t *testing.T) {
+	svc := mustService(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.Header.Get("Authorization"); got != "Bearer "+"root-token" {
+			t.Fatalf("unexpected auth header: %s", got)
+		}
+		expected := MiddleTier + "emea/beta/users/user@example.com/?enableGuest=true&includeIBBarredUsers=true&isMailAddress=true&skypeTeamsInfo=true&throwIfNotFound=false"
+		if req.URL.String() != expected {
+			t.Fatalf("unexpected URL: %s", req.URL.String())
+		}
+		return response(http.StatusOK, loadFixture(t, "resources/mt/user/user-1.json")), nil
+	}))
 
-func TestParseUsersResponse(t *testing.T) {
-	f, err := os.Open("../../resources/mt/user/user-1.json")
-	defer f.Close()
+	user, err := svc.GetUser("user@example.com")
 	if err != nil {
-		t.Fatalf("unable to open file: %v", err)
+		t.Fatalf("expected user lookup to succeed: %v", err)
+	}
+	if user.DisplayName != "Denys Vitali" {
+		t.Fatalf("unexpected display name: %s", user.DisplayName)
 	}
 
-	var typedEntry = struct {
-		Value models.User
-		Type  string
-	}{}
-
-	var user models.User
-	dec := json.NewDecoder(f)
-	dec.DisallowUnknownFields()
-	err = dec.Decode(&typedEntry)
+	me, err := svc.GetMe()
 	if err != nil {
-		t.Fatalf("unable to decode JSON: %v", err)
+		t.Fatalf("expected get me to succeed: %v", err)
 	}
-
-	assert.Equal(t, "Microsoft.SkypeSpaces.MiddleTier.Models.AadMember", typedEntry.Type)
-	user = typedEntry.Value
-
-	fmt.Printf("user:%+v\n", user)
-	assert.NotNil(t, user)
-	assert.Equal(t, "Denys", user.GivenName)
-	assert.Equal(t, "Vitali", user.Surname)
-	assert.Equal(t, "Denys Vitali", user.DisplayName)
-	assert.Equal(t, "teams-cli@outlook.com", user.Email)
-	assert.True(t, user.SkypeTeamsInfo.IsSkypeTeamsUser)
-	assert.True(t, user.AccountEnabled)
-	assert.True(t, user.IsSipDisabled)
-	assert.False(t, user.IsShortProfile)
-	assert.Equal(t, "8:orgid:fa814989-41d0-4d4b-a365-e5f44e406847", user.Mri)
+	if me.Email != user.Email {
+		t.Fatalf("expected get me to use token email, got %s", me.Email)
+	}
 }
 
-func getTokenEmail(t *testing.T) (string, error) {
-	rootToken, err := api.GetRootToken()
-	if err != nil {
-		t.Fatalf("unable to get root token: %v", err)
-	}
+func TestFetchShortProfile(t *testing.T) {
+	svc := mustService(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			t.Fatalf("unexpected method: %s", req.Method)
+		}
+		if ct := req.Header.Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("unexpected content-type: %s", ct)
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("unable to read body: %v", err)
+		}
+		if string(body) != `["8:orgid:user-1","8:orgid:user-2"]` {
+			t.Fatalf("unexpected body: %s", string(body))
+		}
+		return response(http.StatusOK, `{"value":[{"displayName":"One","email":"one@example.com","givenName":"One","surname":"User","isShortProfile":true,"jobTitle":"","objectId":"1","tenantName":"Tenant","type":"ADUser","userLocation":"Remote","userPrincipalName":"one@example.com"},{"displayName":"Two","email":"two@example.com","givenName":"Two","surname":"User","isShortProfile":true,"jobTitle":"","objectId":"2","tenantName":"Tenant","type":"ADUser","userLocation":"Remote","userPrincipalName":"two@example.com"}],"type":"Users"}`), nil
+	}))
 
-	return mt.GetTokenEmail(rootToken)
+	users, err := svc.FetchShortProfile("8:orgid:user-1", "8:orgid:user-2")
+	if err != nil {
+		t.Fatalf("expected short profile lookup to succeed: %v", err)
+	}
+	if len(users) != 2 || users[1].Email != "two@example.com" {
+		t.Fatalf("unexpected users: %#v", users)
+	}
 }
 
-func TestGetMe(t *testing.T) {
-	userSvc := initTest(t)
+func TestGetProfilePictureAndTeamsProfilePicture(t *testing.T) {
+	jpg := []byte("jpeg-bytes")
+	base64Payload := base64.StdEncoding.EncodeToString(jpg)
+	callCount := 0
+	svc := mustService(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		callCount++
+		switch callCount {
+		case 1:
+			if req.Header.Get("Authorization") == "" {
+				t.Fatal("expected authorization header")
+			}
+			return response(http.StatusOK, base64Payload), nil
+		case 2:
+			if cookie := req.Header.Get("Cookie"); cookie != "TSAUTHCOOKIE=teams-token" {
+				t.Fatalf("unexpected cookie header: %s", cookie)
+			}
+			return response(http.StatusOK, string(jpg)), nil
+		default:
+			t.Fatalf("unexpected extra request: %s", req.URL.String())
+			return nil, nil
+		}
+	}))
 
-	user, err := userSvc.GetMe()
-	assert.Nil(t, err)
-	assert.NotNil(t, user)
-	fmt.Printf("user=%#v\n", user)
-}
-
-func TestFetchShortProfiles(t *testing.T) {
-	userSvc := initTest(t)
-	user, err := userSvc.GetMe()
+	profilePicture, err := svc.GetProfilePicture("user@example.com")
 	if err != nil {
-		t.Fatalf("unable to get me: %v", err)
+		t.Fatalf("expected profile picture to decode: %v", err)
+	}
+	if string(profilePicture) != string(jpg) {
+		t.Fatalf("unexpected picture bytes: %q", string(profilePicture))
 	}
 
-	mris := []string{user.Mri}
-
-	users, err := userSvc.FetchShortProfile(mris...)
-	assert.Nil(t, err)
-	assert.NotNil(t, users)
-	assert.Equal(t, 1, len(users))
-
-	assert.Equal(t, user.Email, users[0].Email)
-	assert.Equal(t, user.DisplayName, users[0].DisplayName)
-
-	fmt.Printf("users=%#v\n", users)
-
+	teamsPicture, err := svc.GetTeamsProfilePicture("user@example.com")
+	if err != nil {
+		t.Fatalf("expected teams profile picture to decode: %v", err)
+	}
+	if string(teamsPicture) != string(jpg) {
+		t.Fatalf("unexpected teams picture bytes: %q", string(teamsPicture))
+	}
 }
 
-func TestGetUserProfilePicture(t *testing.T) {
-	userSvc := initTest(t)
-	email, err := getTokenEmail(t)
-
-	profilePicture, err := userSvc.GetProfilePicture(email)
-	assert.Nil(t, err)
-	assert.NotNil(t, profilePicture)
-	assert.Greater(t, len(profilePicture), 0)
-	f, err := ioutil.TempFile(os.TempDir(), "teams-pkg*.jpg")
-	if err != nil {
-		t.Errorf("unable to create temp file: %v", err)
-		t.Fail()
+func TestGetTokenEmail(t *testing.T) {
+	email, err := GetTokenEmail(&api.TeamsToken{Inner: mustParseJWT(t, "root-token", map[string]any{"email": "user@example.com"}), Type: api.TokenBearer})
+	if err != nil || email != "user@example.com" {
+		t.Fatalf("unexpected email claim result: %s %v", email, err)
 	}
+	upn, err := GetTokenEmail(&api.TeamsToken{Inner: mustParseJWT(t, "root-token", map[string]any{"upn": "user@example.com"}), Type: api.TokenBearer})
+	if err != nil || upn != "user@example.com" {
+		t.Fatalf("unexpected upn claim result: %s %v", upn, err)
+	}
+	_, err = GetTokenEmail(&api.TeamsToken{Inner: mustParseJWT(t, "root-token", map[string]any{"name": "user"}), Type: api.TokenBearer})
+	if err == nil || !strings.Contains(err.Error(), "email nor upn") {
+		t.Fatalf("expected missing claim error, got %v", err)
+	}
+}
 
-	_, _ = f.Write(profilePicture)
-	_ = f.Close()
-	fmt.Printf("profile picture saved to %v", f.Name())
+func mustService(t *testing.T, transport http.RoundTripper) *Service {
+	t.Helper()
+	svc, err := NewMiddleTierService(
+		api.Emea,
+		&api.TeamsToken{Inner: mustParseJWT(t, "root-token", map[string]any{"email": "user@example.com"}), Type: api.TokenBearer},
+		&api.TeamsToken{Inner: mustParseJWT(t, "teams-token", map[string]any{"email": "user@example.com"}), Type: api.TokenBearer},
+	)
+	if err != nil {
+		t.Fatalf("unable to create service: %v", err)
+	}
+	svc.client = &http.Client{Transport: transport}
+	return svc
+}
+
+func response(status int, body string) *http.Response {
+	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+}
+
+func loadFixture(t *testing.T, relativePath string) string {
+	t.Helper()
+	_, filename, _, _ := runtime.Caller(0)
+	root := filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+	body, err := os.ReadFile(filepath.Join(root, relativePath))
+	if err != nil {
+		t.Fatalf("unable to read fixture %s: %v", relativePath, err)
+	}
+	return string(body)
+}
+
+func mustParseJWT(t *testing.T, raw string, claims map[string]any) *jwt.Token {
+	t.Helper()
+	encodedClaims, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("unable to marshal claims: %v", err)
+	}
+	encoded := fmt.Sprintf("%s.%s.signature", base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)), base64.RawURLEncoding.EncodeToString(encodedClaims))
+	if raw == "" {
+		raw = encoded
+	}
+	return &jwt.Token{Raw: raw, Claims: jwt.MapClaims(claims)}
 }

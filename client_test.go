@@ -1,121 +1,118 @@
-package teams_api_test
+package teams_api
 
 import (
-	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	teams_api "github.com/fossteams/teams-api"
-	"github.com/fossteams/teams-api/pkg/csa"
-	"github.com/logrusorgru/aurora"
-	"github.com/stretchr/testify/assert"
-	"golang.org/x/net/html"
-	"sort"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/dgrijalva/jwt-go"
+	api "github.com/fossteams/teams-api/pkg"
+	"github.com/fossteams/teams-api/pkg/csa"
+	"github.com/fossteams/teams-api/pkg/mt"
 )
 
-func TestTeamsClient_GetConversations(t *testing.T) {
-	c := mustGetClient(t)
-	c.Debug(true)
+type roundTripFunc func(*http.Request) (*http.Response, error)
 
-	convs, err := c.GetConversations()
-	if err != nil {
-		t.Fatalf("unable to get conversations: %v", err)
-	}
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
-	if convs == nil {
-		t.Fatal("convs should never be nil!")
-	}
-
-	// Pretty print conversations
-	fmt.Printf("%s\n", aurora.Bold("Teams"))
-	sort.Sort(csa.TeamsByName(convs.Teams))
-	for _, t := range convs.Teams {
-		fmt.Printf("%s (%d users)\n",
-			aurora.Magenta(t.DisplayName),
-			aurora.Green(t.MembershipSummary.UserRoleCount),
-		)
-		sort.Sort(csa.ChannelsByName(t.Channels))
-		for _, channel := range t.Channels {
-			fmt.Printf("\t%s\n",
-				aurora.Red(channel.DisplayName))
+func TestTeamsClientMethods(t *testing.T) {
+	defaultClient := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = defaultClient })
+	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case csa.ChatSvcAgg + "v1/teams/users/me?enableMembershipSummary=true&isPrefetch=false":
+			return response(http.StatusOK, loadFixture(t, "resources/chatsvcagg/conversations/conversations-1.json")), nil
+		case csa.ChatSvcAgg + "v1/teams/users/me/pinnedChannels":
+			return response(http.StatusOK, `{"OrderVersion":1,"PinChannelOrder":["19:one"]}`), nil
+		case csa.MessagesHost + "v1/users/ME/conversations/19:10dd444580a348eea3a3a335035aee3d@thread.tacv2/messages?pageSize=200&startTime=1&view=msnp24Equivalent%7CsupportsMessageProperties":
+			return response(http.StatusOK, loadFixture(t, "resources/chatsvcagg/messages/messages-1.json")), nil
+		case mt.MiddleTier + "emea/beta/users/user@example.com/?enableGuest=true&includeIBBarredUsers=true&isMailAddress=true&skypeTeamsInfo=true&throwIfNotFound=false":
+			return response(http.StatusOK, loadFixture(t, "resources/mt/user/user-1.json")), nil
+		case mt.MiddleTier + "emea/beta/users/tenants":
+			return response(http.StatusOK, loadFixture(t, "resources/mt/tenants/tenants-1.json")), nil
+		default:
+			t.Fatalf("unexpected request: %s", req.URL.String())
+			return nil, nil
 		}
-		fmt.Printf("\n")
-	}
-}
+	})}
 
-func TestTeamsClient_GetMessages(t *testing.T) {
-	c := mustGetClient(t)
-	c.Debug(true)
-
-	convs, err := c.GetConversations()
+	chatSvc, err := csa.NewCSAService(
+		&api.TeamsToken{Inner: mustParseJWT(t, "csa-token", map[string]any{"email": "user@example.com"}), Type: api.TokenBearer},
+		&api.SkypeToken{Inner: mustParseJWT(t, "skype-token", map[string]any{"email": "user@example.com"}), Type: api.TokenSkype},
+	)
 	if err != nil {
-		t.Fatalf("unable to get conversations: %v", err)
+		t.Fatalf("unable to create chat service: %v", err)
 	}
-
-	if convs == nil {
-		t.Fatal("convs should never be nil!")
-	}
-
-	// Get first team, first channel
-	team := convs.Teams[0]
-	channel := team.Channels[0]
-	assert.NotNil(t, channel)
-
-	fmt.Printf("%s\n", aurora.Red(team.DisplayName))
-	fmt.Printf("%s\n", aurora.Yellow(channel.DisplayName))
-
-	messages, err := c.GetMessages(&channel)
+	mtSvc, err := mt.NewMiddleTierService(
+		api.Emea,
+		&api.TeamsToken{Inner: mustParseJWT(t, "root-token", map[string]any{"email": "user@example.com"}), Type: api.TokenBearer},
+		&api.TeamsToken{Inner: mustParseJWT(t, "teams-token", map[string]any{"email": "user@example.com"}), Type: api.TokenBearer},
+	)
 	if err != nil {
-		t.Fatalf("unable to get channel messages: %v", err)
+		t.Fatalf("unable to create MT service: %v", err)
 	}
-	assert.Greater(t, len(messages), 0)
 
-	for _, m := range messages {
+	client := &TeamsClient{chatSvc: chatSvc, mtSvc: mtSvc}
+	client.Debug(true)
 
-		fmt.Printf("%s\n", aurora.Bold(aurora.Green(m.ImDisplayName)))
-		z := html.NewTokenizer(bytes.NewBuffer([]byte(m.Content)))
-		for {
-			tt := z.Next()
-			if tt == html.ErrorToken {
-				break
-			}
-
-			switch tt {
-			case html.TextToken:
-				text := string(z.Text())
-				if strings.TrimSpace(text) == "" {
-					continue
-				}
-				fmt.Printf("\t%v\n", aurora.Blue(text))
-			}
-			if tt == html.ErrorToken {
-				break
-			}
-		}
-		fmt.Printf("\n")
+	conversations, err := client.GetConversations()
+	if err != nil || len(conversations.Teams) != 1 {
+		t.Fatalf("unexpected conversations result: %#v %v", conversations, err)
+	}
+	messages, err := client.GetMessages(&conversations.Teams[0].Channels[0])
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("unexpected messages result: %#v %v", messages, err)
+	}
+	me, err := client.GetMe()
+	if err != nil || me.Email != "teams-cli@outlook.com" {
+		t.Fatalf("unexpected me result: %#v %v", me, err)
+	}
+	tenants, err := client.GetTenants()
+	if err != nil || len(tenants) != 1 {
+		t.Fatalf("unexpected tenants result: %#v %v", tenants, err)
+	}
+	pinnedChannels, err := client.GetPinnedChannels()
+	if err != nil || len(pinnedChannels) != 1 || pinnedChannels[0] != "19:one" {
+		t.Fatalf("unexpected pinned channels: %#v %v", pinnedChannels, err)
+	}
+	if client.ChatSvc() == nil {
+		t.Fatal("expected chat service")
 	}
 }
 
-func mustGetClient(t *testing.T) *teams_api.TeamsClient {
-	c, err := teams_api.New()
+func response(status int, body string) *http.Response {
+	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+}
+
+func loadFixture(t *testing.T, relativePath string) string {
+	t.Helper()
+	_, filename, _, _ := runtime.Caller(0)
+	root := filepath.Clean(filepath.Join(filepath.Dir(filename)))
+	body, err := os.ReadFile(filepath.Join(root, relativePath))
 	if err != nil {
-		t.Fatalf("unable to create teams client: %v", err)
+		t.Fatalf("unable to read fixture %s: %v", relativePath, err)
 	}
-	return c
+	return string(body)
 }
 
-func TestTeamsClient_GetMe(t *testing.T) {
-	c := mustGetClient(t)
-	user, err := c.GetMe()
-	assert.Nil(t, err)
-	assert.NotNil(t, user)
-	fmt.Printf("user = %#v\n", user)
-}
-
-func TestTeamsClient_GetPinnedChannels(t *testing.T) {
-	c := mustGetClient(t)
-	pinnedChannels, err := c.GetPinnedChannels()
-	assert.Nil(t, err)
-	assert.NotNil(t, pinnedChannels)
-	fmt.Printf("pinnedChannels = %#v\n", pinnedChannels)
+func mustParseJWT(t *testing.T, raw string, claims map[string]any) *jwt.Token {
+	t.Helper()
+	encodedClaims, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("unable to marshal claims: %v", err)
+	}
+	encoded := fmt.Sprintf("%s.%s.signature", base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)), base64.RawURLEncoding.EncodeToString(encodedClaims))
+	if raw == "" {
+		raw = encoded
+	}
+	return &jwt.Token{Raw: raw, Claims: jwt.MapClaims(claims)}
 }

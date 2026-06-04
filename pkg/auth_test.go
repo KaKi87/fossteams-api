@@ -1,39 +1,113 @@
 package api
 
 import (
-	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
+
+	"github.com/dgrijalva/jwt-go"
 )
 
-func TestParseAuth(t *testing.T) {
-	const response = `{"tokens":{"skypeToken":"eyJhbGciOiJSUzI1NiIsImtpZCI6IjEwMiIsInR5cCI6IkpXVCJ9.aaa.eee","expiresIn":86397},"region":"emea","partition":"emea01","regionGtms":{"ams":"https://eu-api.asm.skype.com","amsV2":"https://eu-prod.asyncgw.teams.microsoft.com","amsS2S":"https://eu-storage.asm.skype.com:444","appsDataLayerService":"https://teams.microsoft.com/datalayer/emea","appsDataLayerServiceS2S":"https://deletion-svc-emea.datalayer.teams.microsoft.com","calling_callControllerServiceUrl":"https://api.cc.skype.com","calling_callStoreUrl":"https://api.flightproxy.teams.microsoft.com/api/v2/ep/api.userstore.skype.com/","calling_conversationServiceUrl":"https://api.flightproxy.teams.microsoft.com/api/v2/epconv","calling_keyDistributionUrl":"https://api.flightproxy.teams.microsoft.com/api/v2/ep/api.cc.skype.com/kd","calling_potentialCallRequestUrl":"https://api.flightproxy.teams.microsoft.com/api/v2/ep/api.cc.skype.com/cc/v1/potentialcall","calling_sharedLineOptionsUrl":"https://api.flightproxy.teams.microsoft.com/api/v2/ep/api.cc.skype.com/cc/v1/sharedLineAppearance","calling_udpTransportUrl":"udp://api.flightproxy.teams.microsoft.com:3478","calling_uploadLogRequestUrl":"https://api.flightproxy.teams.microsoft.com/api/v2/ep/api.cc.skype.com/cc/v1/uploadlog/","callingS2S_Broker":"https://api.broker.skype.com","callingS2S_CallController":"https://api.cc.skype.com","callingS2S_CallStore":"https://api.userstore.skype.com/","callingS2S_ContentSharing":"https://api.css.skype.com/contentshare/","callingS2S_ConversationService":"https://api.conv.skype.com/conv/","callingS2S_EnterpriseProxy":"https://api.flightproxy.teams.microsoft.com","callingS2S_MediaController":"https://api.mc.skype.com/media/v2/conversations","callingS2S_PlatformMediaAgent":"https://pma.plat.skype.com:6448/platform/v1/incomingcall","chatService":"https://emea.ng.msg.teams.microsoft.com","chatServiceS2S":"https://emea.pg.msg.infra.teams.microsoft.com","drad":"https://eu.msdrad.skype.com/","mailhookS2S":"https://mailhook.teams.microsoft.com/emea","middleTier":"https://teams.microsoft.com/api/mt/emea","middleTierS2S":"https://teams.microsoft.com/api/mt/emea","mtImageService":"https://teams.microsoft.com/api/mt/emea","powerPointStateService":"https://emea.pptservicescast.officeapps.live.com","search":"https://eu-prod.asyncgw.teams.microsoft.com/msgsearch","searchTelemetry":"https://eu-prod.asyncgw.teams.microsoft.com/msgsearch","teamsAndChannelsService":"https://teams.microsoft.com/api/mt/emea","teamsAndChannelsProvisioningService":"https://teams.microsoft.com/fabric/emea/templates/api","urlp":"https://urlp.asm.skype.com","urlpV2":"https://eu-prod.asyncgw.teams.microsoft.com/urlp","unifiedPresence":"https://presence.teams.microsoft.com","userEntitlementService":"https://teams.microsoft.com/api/ues/emea","userIntelligenceService":"https://teams.microsoft.com/api/nss/emea","userProfileService":"https://teams.microsoft.com/api/userprofilesvc/emea","userProfileServiceS2S":"https://userprofilesvc-emea.teams.microsoft.com","amdS2S":"https://eu-distr.asm.skype.com:444","chatServiceAggregator":"https://chatsvcagg.teams.microsoft.com"},"regionSettings":{"isUnifiedPresenceEnabled":true,"isOutOfOfficeIntegrationEnabled":true,"isContactMigrationEnabled":true,"isAppsDiscoveryEnabled":true,"isFederationEnabled":true},"licenseDetails":{"isFreemium":false,"isBasicLiveEventsEnabled":true,"isTrial":false,"isAdvComms":false}}`
-	strReader := bytes.NewReader([]byte(response))
-	dec := json.NewDecoder(strReader)
-	dec.DisallowUnknownFields()
+type roundTripFunc func(*http.Request) (*http.Response, error)
 
-	var authResp AuthzResponse
-	err := dec.Decode(&authResp)
-
-	if err != nil {
-		t.Error(err)
-		t.Fail()
-	}
-
-	fmt.Printf("%v", authResp)
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
-func TestRefreshToken(t *testing.T) {
-	authzClient := New(nil)
-	rootToken, err := GetRootToken()
-	if err != nil {
-		t.Fatalf("unable to get root token: %v", err)
-	}
-	skypeJwt, err := authzClient.Authz(rootToken, AuthzRefresh)
-	if err != nil {
-		t.Fatalf("unable to get refresh token: %v", err)
-	}
+func TestParseAuthResponse(t *testing.T) {
+	refreshedRaw := mustRawJWT(t, map[string]any{"email": "user@example.com"})
+	response := fmt.Sprintf(`{"tokens":{"skypeToken":"%s","expiresIn":86397},"region":"emea","partition":"emea01","regionGtms":{"chatServiceAggregator":"https://chatsvcagg.teams.microsoft.com"},"regionSettings":{"isUnifiedPresenceEnabled":true,"isOutOfOfficeIntegrationEnabled":true,"isContactMigrationEnabled":true,"isAppsDiscoveryEnabled":true,"isFederationEnabled":true},"licenseDetails":{"isFreemium":false,"isBasicLiveEventsEnabled":true,"isTrial":false,"isAdvComms":false}}`, refreshedRaw)
 
-	fmt.Printf("got token=%+v", skypeJwt.Inner.Claims)
+	client := New(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			t.Fatalf("unexpected method: %s", req.Method)
+		}
+		if req.URL.String() != TEAMS_API_ENDPOINT+"/authsvc/v1.0/authz" {
+			t.Fatalf("unexpected URL: %s", req.URL.String())
+		}
+		if got := req.Header.Get("ms-teams-authz-type"); got != AuthzRefresh {
+			t.Fatalf("unexpected authz type: %s", got)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer "+"root-token" {
+			t.Fatalf("unexpected authorization header: %s", got)
+		}
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(response)),
+		}, nil
+	})})
+
+	token := &RootSkypeToken{Inner: mustParseJWT(t, "root-token", map[string]any{"email": "user@example.com"}), Type: TokenBearer}
+	refreshed, err := client.Authz(token, AuthzRefresh)
+	if err != nil {
+		t.Fatalf("expected authz to succeed: %v", err)
+	}
+	if refreshed == nil || refreshed.Inner == nil {
+		t.Fatal("expected refreshed token")
+	}
+	if refreshed.Inner.Raw != refreshedRaw {
+		t.Fatalf("unexpected token payload: %s", refreshed.Inner.Raw)
+	}
+	if refreshed.Type != TokenBearer {
+		t.Fatalf("unexpected token type: %s", refreshed.Type)
+	}
+}
+
+func TestAuthzReturnsTypedError(t *testing.T) {
+	client := New(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"errorCode":"GuestUserNotRedeemed","message":"select a tenant first"}`)),
+		}, nil
+	})})
+
+	_, err := client.Authz(&RootSkypeToken{Inner: mustParseJWT(t, "root-token", map[string]any{"email": "user@example.com"}), Type: TokenBearer}, AuthzRefresh)
+	if err == nil {
+		t.Fatal("expected authz to fail")
+	}
+	authzErr, ok := err.(AuthzError)
+	if !ok {
+		t.Fatalf("expected AuthzError, got %T", err)
+	}
+	if authzErr.ErrorCode != GuestUserNotRedeemed {
+		t.Fatalf("unexpected error code: %s", authzErr.ErrorCode)
+	}
+}
+
+func TestAuthString(t *testing.T) {
+	root := &TeamsToken{Inner: mustParseJWT(t, "root-token", map[string]any{"email": "user@example.com"}), Type: TokenBearer}
+	if got := AuthString(root); got != "Bearer "+"root-token" {
+		t.Fatalf("unexpected bearer auth string: %s", got)
+	}
+	root.Type = TokenSkype
+	if got := AuthString(root); got != "skypetoken=root-token" {
+		t.Fatalf("unexpected skype auth string: %s", got)
+	}
+	if got := AuthString(nil); got != "" {
+		t.Fatalf("unexpected empty auth string: %s", got)
+	}
+}
+
+func mustParseJWT(t *testing.T, raw string, claims map[string]any) *jwt.Token {
+	t.Helper()
+	if raw == "" {
+		raw = mustRawJWT(t, claims)
+	}
+	return &jwt.Token{Raw: raw, Claims: jwt.MapClaims(claims)}
+}
+
+func mustRawJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	encodedClaims, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("unable to marshal claims: %v", err)
+	}
+	return fmt.Sprintf("%s.%s.signature", base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)), base64.RawURLEncoding.EncodeToString(encodedClaims))
 }
